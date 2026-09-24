@@ -62,3 +62,22 @@ class EventError(BaseModel):
 class RenderResponse(BaseModel):
     intervals: list[Interval]
     errors: list[EventError]
+
+
+class ChannelStats(BaseModel):
+    channel: int
+    # 该通道所有音区间时长之和(含零长度音,贡献为 0)
+    total_duration_ms: int
+    # 半开区间 [start_ms, end_ms) 内同时发声的最大音数;零长度音不参与
+    peak_polyphony: int
+    # 首次达到 peak_polyphony 的时刻;无正时长音时为 null
+    peak_at_ms: int | None
+    # 松键后仅靠延音踏板延续的时长之和(松键时刻 -> 抬踏板或 end_ms)
+    sustained_duration_ms: int
+
+
+class RenderStatsResponse(BaseModel):
+    intervals: list[Interval]
+    errors: list[EventError]
+    # 每个出现过按键(note_on)的通道一项,按 channel 升序
+    stats: list[ChannelStats]

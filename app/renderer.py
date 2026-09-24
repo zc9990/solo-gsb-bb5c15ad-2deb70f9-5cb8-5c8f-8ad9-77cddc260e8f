@@ -32,6 +32,9 @@ class _Voice:
     pitch: int
     start_ms: int
     end_ms: int | None = None
+    # 踩着踏板松键的时刻;None 表示未经历“松键后踏板延续”,
+    # 用于计算 sustained_duration_ms
+    released_ms: int | None = None
 
 
 def _get_attrs(ev: Any) -> tuple[int, int, str, int | None]:
@@ -41,12 +44,12 @@ def _get_attrs(ev: Any) -> tuple[int, int, str, int | None]:
     return ev.time_ms, ev.channel, ev.type, getattr(ev, "pitch", None)
 
 
-def render(end_ms: int, events: Iterable[Any]) -> dict[str, list[dict]]:
-    """把原始事件流渲染成实际发声区间。
+def _collect(
+    end_ms: int, events: Iterable[Any]
+) -> tuple[list[_Voice], list[dict]]:
+    """把原始事件流处理成发声区间(内部对象)与错误列表。
 
-    返回 ``{"intervals": [...], "errors": [...]}``:
-    intervals 按起音(note_on)事件的处理顺序排列;
-    errors 中的 index 为事件在输入 events 中的下标(从 0 开始)。
+    区间的 ``end_ms`` 为 None 表示仍在发声,由调用方按 end_ms 收口。
     """
     pedal_down: set[int] = set()                 # 正踩着踏板的通道
     held: dict[tuple[int, int], deque[_Voice]] = {}  # (通道, 音高) -> 仍按住的音
@@ -73,6 +76,7 @@ def render(end_ms: int, events: Iterable[Any]) -> dict[str, list[dict]]:
                 del held[(channel, pitch)]
             if channel in pedal_down:
                 # 踩着踏板:键松开但声音延续,记为待释放
+                voice.released_ms = time_ms
                 pending.setdefault(channel, []).append(voice)
             else:
                 voice.end_ms = time_ms
@@ -94,16 +98,92 @@ def render(end_ms: int, events: Iterable[Any]) -> dict[str, list[dict]]:
                 for voice in pending.pop(channel, ()):
                     voice.end_ms = time_ms
 
-    # 结束时刻:仍在发声的音(仍按住 / 踏板延续中)统一关闭
-    intervals: list[dict] = []
+    return voices, errors
+
+
+def _interval_dict(voice: _Voice, end_ms: int) -> dict:
+    return {
+        "channel": voice.channel,
+        "pitch": voice.pitch,
+        "start_ms": voice.start_ms,
+        "end_ms": voice.end_ms if voice.end_ms is not None else end_ms,
+    }
+
+
+def _channel_stats(voices: list[_Voice], end_ms: int) -> list[dict]:
+    """按通道汇总统计,通道号升序。
+
+    只统计出现过 note_on 的通道(无效事件不产生区间,不影响统计)。
+    峰值按半开区间 [start_ms, end_ms) 内同时发声的音数扫描;
+    零长度音(start_ms == end_ms)不参与峰值。
+    """
+    by_channel: dict[int, list[_Voice]] = {}
     for voice in voices:
-        intervals.append(
+        by_channel.setdefault(voice.channel, []).append(voice)
+
+    stats: list[dict] = []
+    for channel in sorted(by_channel):
+        channel_voices = by_channel[channel]
+        total_duration_ms = 0
+        sustained_duration_ms = 0
+        # 时刻 -> 该时刻同时发生的净变化数:起音 +1,结束 -1(零长度除外)
+        deltas: dict[int, int] = {}
+        has_positive = False
+
+        for voice in channel_voices:
+            stop_ms = voice.end_ms if voice.end_ms is not None else end_ms
+            duration = stop_ms - voice.start_ms
+            total_duration_ms += duration
+            if duration > 0:
+                has_positive = True
+                deltas[voice.start_ms] = deltas.get(voice.start_ms, 0) + 1
+                deltas[stop_ms] = deltas.get(stop_ms, 0) - 1
+            if voice.released_ms is not None:
+                # 松键后靠踏板延续的部分:松键时刻 -> 抬踏板或 end_ms
+                sustained_duration_ms += stop_ms - voice.released_ms
+
+        peak_polyphony = 0
+        peak_at_ms: int | None = None
+        if has_positive:
+            active = 0
+            for time_ms in sorted(deltas):
+                active += deltas[time_ms]
+                if active > peak_polyphony:
+                    # 只在首次达到更高峰值时记录,即首次达到峰值的时刻
+                    peak_polyphony = active
+                    peak_at_ms = time_ms
+
+        stats.append(
             {
-                "channel": voice.channel,
-                "pitch": voice.pitch,
-                "start_ms": voice.start_ms,
-                "end_ms": voice.end_ms if voice.end_ms is not None else end_ms,
+                "channel": channel,
+                "total_duration_ms": total_duration_ms,
+                "peak_polyphony": peak_polyphony,
+                "peak_at_ms": peak_at_ms,
+                "sustained_duration_ms": sustained_duration_ms,
             }
         )
 
+    return stats
+
+
+def render(end_ms: int, events: Iterable[Any]) -> dict[str, list[dict]]:
+    """把原始事件流渲染成实际发声区间。
+
+    返回 ``{"intervals": [...], "errors": [...]}``:
+    intervals 按起音(note_on)事件的处理顺序排列;
+    errors 中的 index 为事件在输入 events 中的下标(从 0 开始)。
+    """
+    voices, errors = _collect(end_ms, events)
+    intervals = [_interval_dict(voice, end_ms) for voice in voices]
     return {"intervals": intervals, "errors": errors}
+
+
+def render_stats(end_ms: int, events: Iterable[Any]) -> dict[str, Any]:
+    """渲染发声区间并附带按通道升序的统计。
+
+    返回 ``{"intervals": [...], "errors": [...], "stats": [...]}``。
+    """
+    voices, errors = _collect(end_ms, events)
+    intervals = [_interval_dict(voice, end_ms) for voice in voices]
+    stats = _channel_stats(voices, end_ms)
+    return {"intervals": intervals, "errors": errors, "stats": stats}

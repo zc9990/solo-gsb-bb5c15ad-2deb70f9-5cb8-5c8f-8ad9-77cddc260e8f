@@ -13,6 +13,7 @@ docker compose up --build
 
 - API 地址:`http://localhost:8000`
 - 渲染接口:`POST http://localhost:8000/render`
+- 渲染 + 通道统计:`POST http://localhost:8000/render/stats`
 - 健康检查:`GET http://localhost:8000/health`
 - 交互式文档(Swagger UI):`http://localhost:8000/docs`
 - OpenAPI Schema:`http://localhost:8000/openapi.json`
@@ -65,6 +66,22 @@ docker compose up --build
 
 请求结构非法(缺字段、`pitch` 缺失、时间为负、事件未按时间非递减排列、事件晚于 `end_ms`)返回 HTTP 422 及校验详情。
 
+### `POST /render/stats`
+
+请求体与 `POST /render` 完全相同(同一个 `RenderRequest`),响应在原有 `intervals`、`errors`
+之外附带 `stats`:每个**出现过按键(`note_on`)**的通道一项,按 `channel` **升序**排列。
+语义错误的事件不参与渲染,因此也不会影响统计。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `channel` | int | 通道号 |
+| `total_duration_ms` | int | 该通道所有音区间时长之和(`end_ms - start_ms` 逐条累加) |
+| `peak_polyphony` | int | 半开区间 `[start_ms, end_ms)` 内同时发声的最大音数;零长度音不参与 |
+| `peak_at_ms` | int \| null | 首次达到 `peak_polyphony` 的时刻;通道内完全没有正时长音时为 `null`(此时峰值为 0) |
+| `sustained_duration_ms` | int | 松键后仅靠延音踏板延续的时长之和:松键时刻 -> 抬踏板或 `end_ms` |
+
+统计基于渲染结果计算,因此重复同音的 FIFO 配对、无效踏板切换等规则与 `/render` 完全一致。
+
 ### 请求示例
 
 ```bash
@@ -116,13 +133,60 @@ curl -s -X POST http://localhost:8000/render \
 }
 ```
 
+### `/render/stats` 请求示例
+
+```bash
+curl -s -X POST http://localhost:8000/render/stats \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "end_ms": 1000,
+    "events": [
+      {"time_ms": 0,   "channel": 0, "type": "note_on",  "pitch": 60},
+      {"time_ms": 0,   "channel": 1, "type": "note_on",  "pitch": 64},
+      {"time_ms": 100, "channel": 0, "type": "pedal_down"},
+      {"time_ms": 200, "channel": 0, "type": "note_off", "pitch": 60},
+      {"time_ms": 300, "channel": 1, "type": "note_off", "pitch": 64},
+      {"time_ms": 800, "channel": 0, "type": "pedal_up"}
+    ]
+  }'
+```
+
+通道 0 的音在 200ms 松键后靠踏板延续到 800ms(延续 600ms);通道 1 没有踩踏板,
+松键即结束。两项统计按通道升序返回:
+
+```json
+{
+  "intervals": [
+    {"channel": 0, "pitch": 60, "start_ms": 0, "end_ms": 800},
+    {"channel": 1, "pitch": 64, "start_ms": 0, "end_ms": 300}
+  ],
+  "errors": [],
+  "stats": [
+    {
+      "channel": 0,
+      "total_duration_ms": 800,
+      "peak_polyphony": 1,
+      "peak_at_ms": 0,
+      "sustained_duration_ms": 600
+    },
+    {
+      "channel": 1,
+      "total_duration_ms": 300,
+      "peak_polyphony": 1,
+      "peak_at_ms": 0,
+      "sustained_duration_ms": 0
+    }
+  ]
+}
+```
+
 ## 项目结构
 
 ```
 app/
-  main.py        # FastAPI 应用:/health、/render
+  main.py        # FastAPI 应用:/health、/render、/render/stats
   schemas.py     # 请求/响应模型与 422 校验
-  renderer.py    # 纯标准库的发声区间渲染核心
+  renderer.py    # 纯标准库的发声区间渲染与通道统计核心
 tests/
   test_renderer.py
 Dockerfile
