@@ -13,6 +13,7 @@ docker compose up --build
 
 - API 地址:`http://localhost:8000`
 - 渲染接口:`POST http://localhost:8000/render`
+- 统计接口:`POST http://localhost:8000/render/stats`
 - 健康检查:`GET http://localhost:8000/health`
 - 交互式文档(Swagger UI):`http://localhost:8000/docs`
 - OpenAPI Schema:`http://localhost:8000/openapi.json`
@@ -116,11 +117,72 @@ curl -s -X POST http://localhost:8000/render \
 }
 ```
 
+### `POST /render/stats`
+
+请求体与 `POST /render` **完全相同**(同一个 `RenderRequest`),响应在原有 `intervals`、`errors` 之外增加 `stats`:每个**出现过按键(`note_on`)的通道**一项,按 `channel` **升序**排列。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `channel` | int | 通道号 |
+| `total_duration_ms` | int | 该通道各音区间时长之和(`Σ(end_ms - start_ms)`,含踏板延续部分) |
+| `peak_polyphony` | int | 半开区间 `[start_ms, end_ms)` 内同时发声的最大音数;**零长度音不参与** |
+| `peak_at_ms` | int \| null | 首次达到峰值复调的时刻;完全没有正时长音时为 `null`(此时峰值为 `0`) |
+| `sustained_duration_ms` | int | 只累加音符**松键之后**靠踏板延续的时长:从配对的 `note_off` 时刻起,到抬踏板截断、或 `end_ms` 截断为止 |
+
+说明:
+
+- 峰值按半开区间结算——同一时刻结束和开始的两个音不重叠(旧音在该时刻已停止,新音在该时刻起音)。
+- `sustained_duration_ms` 是松键后的"额外"延续时长,不含按住键发声的部分;松键时踏板未踩下、或抬踏板与松键同时刻(零长度)的音贡献为 0。
+- 同音重复仍按 FIFO 配对;语义错误(无法配对的松键、重复踏板切换)照常进 `errors`,不改变有效事件的统计结果。
+
+请求示例:
+
+```bash
+curl -s -X POST http://localhost:8000/render/stats \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "end_ms": 1000,
+    "events": [
+      {"time_ms": 0,   "channel": 0, "type": "note_on",  "pitch": 60},
+      {"time_ms": 50,  "channel": 0, "type": "note_on",  "pitch": 64},
+      {"time_ms": 100, "channel": 0, "type": "pedal_down"},
+      {"time_ms": 200, "channel": 0, "type": "note_off", "pitch": 60},
+      {"time_ms": 250, "channel": 0, "type": "note_off", "pitch": 64},
+      {"time_ms": 400, "channel": 0, "type": "pedal_up"}
+    ]
+  }'
+```
+
+响应:
+
+```json
+{
+  "intervals": [
+    {"channel": 0, "pitch": 60, "start_ms": 0, "end_ms": 400},
+    {"channel": 0, "pitch": 64, "start_ms": 50, "end_ms": 400}
+  ],
+  "errors": [],
+  "stats": [
+    {
+      "channel": 0,
+      "total_duration_ms": 750,
+      "peak_polyphony": 2,
+      "peak_at_ms": 50,
+      "sustained_duration_ms": 350
+    }
+  ]
+}
+```
+
+- 两个音区间时长 `400 + 350 = 750`;
+- 两音在 `[50, 200)` 同时发声,峰值 `2`,首次达到在 `50ms`;
+- 踏板延续 `(400-200) + (400-250) = 350`。
+
 ## 项目结构
 
 ```
 app/
-  main.py        # FastAPI 应用:/health、/render
+  main.py        # FastAPI 应用:/health、/render、/render/stats
   schemas.py     # 请求/响应模型与 422 校验
   renderer.py    # 纯标准库的发声区间渲染核心
 tests/

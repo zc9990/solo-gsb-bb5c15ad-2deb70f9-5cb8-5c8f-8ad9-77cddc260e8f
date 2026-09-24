@@ -7,6 +7,7 @@ from app.renderer import (
     PEDAL_ALREADY_UP,
     UNPAIRED_NOTE_OFF,
     render,
+    render_stats,
 )
 
 
@@ -209,6 +210,179 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(
             result["errors"], [{"index": 1, "reason": UNPAIRED_NOTE_OFF}]
         )
+
+
+class RenderStatsTests(unittest.TestCase):
+    def test_single_note_basic_stats(self):
+        result = render_stats(
+            1000,
+            [ev(0, 0, "note_on", 60), ev(500, 0, "note_off", 60)],
+        )
+        self.assertEqual(result["intervals"][0]["end_ms"], 500)
+        self.assertEqual(
+            result["stats"],
+            [
+                {
+                    "channel": 0,
+                    "total_duration_ms": 500,
+                    "peak_polyphony": 1,
+                    "peak_at_ms": 0,
+                    "sustained_duration_ms": 0,
+                }
+            ],
+        )
+
+    def test_peak_polyphony_half_open_and_peak_at(self):
+        # 音A [0,100),音B [100,200):半开区间不重叠,峰值 1,首次峰值在 0
+        # 音C [50,150):与 A、B 分别重叠,峰值 2,首次在 50
+        result = render_stats(
+            300,
+            [
+                ev(0, 0, "note_on", 60),
+                ev(50, 0, "note_on", 62),
+                ev(100, 0, "note_off", 60),
+                ev(100, 0, "note_on", 64),
+                ev(150, 0, "note_off", 62),
+                ev(200, 0, "note_off", 64),
+            ],
+        )
+        stats = result["stats"][0]
+        self.assertEqual(stats["total_duration_ms"], 100 + 100 + 100)
+        self.assertEqual(stats["peak_polyphony"], 2)
+        self.assertEqual(stats["peak_at_ms"], 50)
+        self.assertEqual(stats["sustained_duration_ms"], 0)
+
+    def test_sustained_duration_until_pedal_up(self):
+        result = render_stats(
+            1000,
+            [
+                ev(0, 0, "note_on", 60),
+                ev(50, 0, "note_on", 64),
+                ev(100, 0, "pedal_down"),
+                ev(200, 0, "note_off", 60),  # 延续 200->400 = 200
+                ev(250, 0, "note_off", 64),  # 延续 250->400 = 150
+                ev(400, 0, "pedal_up"),
+            ],
+        )
+        stats = result["stats"][0]
+        self.assertEqual(stats["total_duration_ms"], 400 + 350)
+        self.assertEqual(stats["sustained_duration_ms"], 350)
+        # 两音在 50..200 重叠,峰值 2,首次在 50
+        self.assertEqual(stats["peak_polyphony"], 2)
+        self.assertEqual(stats["peak_at_ms"], 50)
+
+    def test_sustained_duration_until_end_ms(self):
+        # 松键后踩踏板延续到 end_ms,中途不抬踏板
+        result = render_stats(
+            1000,
+            [
+                ev(0, 0, "pedal_down"),
+                ev(100, 0, "note_on", 60),
+                ev(300, 0, "note_off", 60),  # 延续 300->1000 = 700
+            ],
+        )
+        stats = result["stats"][0]
+        self.assertEqual(stats["total_duration_ms"], 900)
+        self.assertEqual(stats["sustained_duration_ms"], 700)
+
+    def test_zero_length_notes_excluded_from_peak(self):
+        # 两个零长度音 + 一个正长度音:峰值 1(零长度不参与)
+        result = render_stats(
+            500,
+            [
+                ev(10, 0, "note_on", 60),
+                ev(10, 0, "note_off", 60),
+                ev(20, 0, "note_on", 60),
+                ev(20, 0, "note_off", 60),
+                ev(30, 0, "note_on", 62),
+                ev(100, 0, "note_off", 62),
+            ],
+        )
+        stats = result["stats"][0]
+        self.assertEqual(stats["total_duration_ms"], 70)
+        self.assertEqual(stats["peak_polyphony"], 1)
+        self.assertEqual(stats["peak_at_ms"], 30)
+        self.assertEqual(stats["sustained_duration_ms"], 0)
+
+    def test_only_zero_length_notes_peak_zero(self):
+        result = render_stats(
+            100,
+            [
+                ev(10, 0, "note_on", 60),
+                ev(10, 0, "note_off", 60),
+                ev(20, 0, "note_on", 60),
+                ev(20, 0, "note_off", 60),
+            ],
+        )
+        stats = result["stats"][0]
+        self.assertEqual(stats["total_duration_ms"], 0)
+        self.assertEqual(stats["peak_polyphony"], 0)
+        self.assertIsNone(stats["peak_at_ms"])
+
+    def test_stats_sorted_by_channel_ascending(self):
+        result = render_stats(
+            1000,
+            [
+                ev(0, 2, "note_on", 60),
+                ev(10, 2, "note_off", 60),
+                ev(0, 0, "note_on", 60),
+                ev(10, 0, "note_off", 60),
+                ev(0, 1, "note_on", 60),
+                ev(10, 1, "note_off", 60),
+            ],
+        )
+        self.assertEqual([s["channel"] for s in result["stats"]], [0, 1, 2])
+
+    def test_pedal_errors_do_not_change_valid_stats(self):
+        # 无效踏板切换 + 无法配对的松键:错误照报,有效音统计不受影响
+        result = render_stats(
+            1000,
+            [
+                ev(0, 0, "pedal_down"),
+                ev(5, 0, "pedal_down"),  # pedal_already_down
+                ev(10, 0, "note_on", 60),
+                ev(20, 0, "note_off", 70),  # unpaired_note_off
+                ev(30, 0, "note_off", 60),  # 配对 60,踏板踩着 -> 延续到 end
+                ev(40, 0, "pedal_up"),
+                ev(50, 0, "pedal_up"),      # pedal_already_up
+            ],
+        )
+        self.assertEqual(
+            [e["reason"] for e in result["errors"]],
+            [PEDAL_ALREADY_DOWN, UNPAIRED_NOTE_OFF, PEDAL_ALREADY_UP],
+        )
+        self.assertEqual(
+            result["intervals"],
+            [{"channel": 0, "pitch": 60, "start_ms": 10, "end_ms": 40}],
+        )
+        stats = result["stats"][0]
+        self.assertEqual(stats["total_duration_ms"], 30)
+        self.assertEqual(stats["sustained_duration_ms"], 10)
+        self.assertEqual(stats["peak_polyphony"], 1)
+        self.assertEqual(stats["peak_at_ms"], 10)
+
+    def test_repeated_same_pitch_under_pedal_fifo_sustain(self):
+        # FIFO 配对;两音最终都在抬踏板截断,各自只统计自己的松键后时长
+        result = render_stats(
+            1000,
+            [
+                ev(0, 0, "note_on", 60),
+                ev(100, 0, "note_on", 60),
+                ev(150, 0, "pedal_down"),
+                ev(200, 0, "note_off", 60),  # FIFO 配对 0ms 的音:延续 200->500
+                ev(300, 0, "note_off", 60),  # 配对 100ms 的音:延续 300->500
+                ev(500, 0, "pedal_up"),
+            ],
+        )
+        stats = result["stats"][0]
+        self.assertEqual(stats["total_duration_ms"], 500 + 400)
+        self.assertEqual(stats["sustained_duration_ms"], 300 + 200)
+        self.assertEqual(stats["peak_polyphony"], 2)
+        self.assertEqual(stats["peak_at_ms"], 100)
+
+    def test_empty_events_stats_empty(self):
+        result = render_stats(0, [])
+        self.assertEqual(result, {"intervals": [], "errors": [], "stats": []})
 
 
 if __name__ == "__main__":

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from .renderer import render
-from .schemas import RenderRequest, RenderResponse
+from .renderer import render, render_stats
+from .schemas import RenderRequest, RenderResponse, RenderStatsResponse
 
 app = FastAPI(
     title="电子琴发声区间 API",
@@ -22,3 +22,8 @@ def health() -> dict[str, str]:
 @app.post("/render", response_model=RenderResponse)
 def post_render(request: RenderRequest) -> dict:
     return render(request.end_ms, request.events)
+
+
+@app.post("/render/stats", response_model=RenderStatsResponse)
+def post_render_stats(request: RenderRequest) -> dict:
+    return render_stats(request.end_ms, request.events)
